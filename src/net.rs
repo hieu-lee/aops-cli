@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::sync::{OnceCell, Semaphore};
 
-const AJAX: &str = "https://artofproblemsolving.com/m/community/ajax.php";
+const AJAX: &str = "https://artofproblemsolving.com/m/community/ajax.php/";
 const HOME: &str = "https://artofproblemsolving.com/";
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 pub const MARKER: &str = ".aops-cache";
@@ -33,8 +33,7 @@ pub struct Client {
     refresh: bool,
     mem: Mutex<HashMap<String, Cell>>,
     marked: std::sync::atomic::AtomicBool,
-    /// Unix ms before which no request may start (set after 429 / challenge pages).
-    cooldown_ms: std::sync::atomic::AtomicU64,
+    service_retry_at_ms: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Deserialize)]
@@ -76,7 +75,7 @@ impl Client {
             refresh,
             mem: Default::default(),
             marked: Default::default(),
-            cooldown_ms: Default::default(),
+            service_retry_at_ms: Default::default(),
         })
     }
 
@@ -221,24 +220,35 @@ impl Client {
             ];
             form.extend(params.iter().map(|(k, v)| (*k, v.as_str())));
             let permit = self.sem.acquire().await.map_err(|e| e.to_string())?;
-            self.wait_cooldown().await;
+            self.wait_for_service().await;
             let resp = self.http.post(AJAX).form(&form).send().await;
-            let (status, body, retry_after) = match resp {
+            let (status, body, outage, retry_after) = match resp {
                 Ok(r) => {
                     let st = r.status();
-                    let ra: Option<u64> = r
+                    let challenge = r
                         .headers()
-                        .get("retry-after")
+                        .get("cf-mitigated")
                         .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.trim().parse().ok());
-                    (st, r.bytes().await.map_err(|e| e.to_string()), ra)
+                        .is_some_and(|v| v.eq_ignore_ascii_case("challenge"));
+                    let outage = st.is_server_error() && !challenge;
+                    let retry_after = outage
+                        .then(|| {
+                            r.headers()
+                                .get(reqwest::header::RETRY_AFTER)?
+                                .to_str()
+                                .ok()?
+                                .trim()
+                                .parse::<u64>()
+                                .ok()
+                        })
+                        .flatten();
+                    (st, r.bytes().await.map_err(|e| e.to_string()), outage, retry_after)
                 }
                 Err(e) => {
                     last = e.to_string();
                     continue;
                 }
             };
-            drop(permit);
             let body = match body {
                 Ok(b) => b,
                 Err(e) => {
@@ -246,10 +256,13 @@ impl Client {
                     continue;
                 }
             };
+            if outage && body.first() == Some(&b'<') {
+                let delay = retry_after.map_or(2000u64 << attempt.min(4), |secs| secs.min(600) * 1000);
+                self.service_retry_at_ms
+                    .fetch_max(now_ms() + delay, std::sync::atomic::Ordering::Relaxed);
+            }
+            drop(permit);
             if !status.is_success() || body.first() == Some(&b'<') {
-                if status.as_u16() == 429 || status.as_u16() == 403 || body.first() == Some(&b'<') {
-                    self.cool_down(retry_after.map_or(2000u64 << attempt.min(4), |s| s.min(600) * 1000));
-                }
                 last = format!(
                     "HTTP {status}{}",
                     if body.first() == Some(&b'<') { " (html/challenge)" } else { "" }
@@ -268,10 +281,7 @@ impl Client {
                     continue;
                 }
                 let up = code.to_ascii_uppercase();
-                if ["INACTIVE", "BUSY", "LIMIT", "TIMEOUT", "TOO_MANY", "UNAVAILABLE"]
-                    .iter()
-                    .any(|w| up.contains(w))
-                {
+                if ["INACTIVE", "BUSY", "TIMEOUT", "UNAVAILABLE"].iter().any(|w| up.contains(w)) {
                     last = format!("{code}{msg}");
                     continue;
                 }
@@ -283,20 +293,15 @@ impl Client {
         Err(format!("{action}: failed after {ATTEMPTS} attempts: {last}"))
     }
 
-    /// Sleep until the shared cooldown (extended by concurrent 429s) has passed; call while holding a permit.
-    async fn wait_cooldown(&self) {
+    async fn wait_for_service(&self) {
         loop {
-            let until = self.cooldown_ms.load(std::sync::atomic::Ordering::Relaxed);
+            let until = self.service_retry_at_ms.load(std::sync::atomic::Ordering::Relaxed);
             let now = now_ms();
             if until <= now {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(until - now)).await;
         }
-    }
-
-    fn cool_down(&self, ms: u64) {
-        self.cooldown_ms.fetch_max(now_ms() + ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Plain GET returning body text (used for IMO official site).

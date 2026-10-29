@@ -62,7 +62,7 @@ aops batch 'problems imo -y 2025 --hard' 'topic 3866863 -c 3 --sol' 'rank -n 8'
 
 ## Notes on the data source
 
-AoPS exposes its community through an ajax endpoint that requires a short-lived anonymous session id, which `aops` obtains from the home page and caches. Please be considerate: the default parallelism is 8 (`-j`), responses are cached, and failures back off exponentially. The community API notice asks for data inquiries to `data-inquiries@artofproblemsolving.com`.
+AoPS exposes its community through an ajax endpoint that requires a short-lived anonymous session id, which `aops` obtains from the home page and caches. Please be considerate: the default parallelism is 8 (`-j`), responses are cached, and transient failures back off exponentially. The community API notice asks for data inquiries to `data-inquiries@artofproblemsolving.com`.
 
 ## Development
 
